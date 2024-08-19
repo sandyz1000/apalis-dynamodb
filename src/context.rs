@@ -1,75 +1,30 @@
 use apalis_core::error::Error;
 use apalis_core::task::task_id::TaskId;
 use apalis_core::worker::WorkerId;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
-use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Workers {
-    pub id: String,
-    pub worker_type: String,
-    pub storage_name: String,
-    pub layers: String,
-    pub last_seen: i64,
-}
-
-impl Default for Workers {
-    fn default() -> Self {
-        let last_seen = Utc::now().timestamp();
-
-        let worker_id = format!("worker-id-{0}", Uuid::new_v4().to_string());
-        Workers {
-            id: worker_id,
-            worker_type: "".to_string(),
-            storage_name: "".to_string(),
-            layers: "".to_string(),
-            last_seen,
-        }
-    }
-}
-
-impl Workers {
-    pub fn new(
-        worker_id: String,
-        worker_type: String,
-        storage_name: String,
-        layers: String,
-        last_seen: i64,
-    ) -> Self {
-        Self {
-            id: worker_id,
-            worker_type,
-            storage_name,
-            layers,
-            last_seen,
-        }
-    }
-}
 
 /// The context for a job is represented here
 /// Used to provide a context when a job is defined through the [Job] trait
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamoTask {
-    pub id: TaskId,
-    pub status: TaskState,
-    pub run_at: i64, // This is the timestamp
-    pub attempts: i32, // Attempt
-    pub max_attempts: i32,
+pub struct DynamoContext {
+    pub id: TaskId,        // This will also be the sort-key, we will have a composite key
+    pub status: TaskState, // This will the #gsi1pk
+    pub run_at: i64,       // This is the timestamp and this will be the sort-key
+    pub attempts: i32,     // Attempt
+    pub max_attempts: i32, // Used to retrieve
     pub last_error: Option<String>,
     pub lock_at: Option<i64>,
-    pub lock_by: Option<WorkerId>,
+    pub lock_by: Option<WorkerId>, // Used to retrieve
     pub done_at: Option<i64>,
-    pub worker_id: WorkerId,
-    pub job: String,
-    pub job_type: String,
 }
 
-impl DynamoTask {
+impl DynamoContext {
     /// Build a new context with defaults given an ID.
-    pub fn new(id: TaskId, worker_id: WorkerId) -> Self {
-        DynamoTask {
+    pub fn new(id: TaskId) -> Self {
+        DynamoContext {
             id,
             status: TaskState::Pending,
             run_at: Utc::now().timestamp(),
@@ -79,9 +34,6 @@ impl DynamoTask {
             max_attempts: 25,
             last_error: None,
             lock_by: None,
-            worker_id,
-            job: "apalis".to_string(),
-            job_type: "basic".to_string(),
         }
     }
 

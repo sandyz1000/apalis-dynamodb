@@ -1,8 +1,7 @@
-use crate::context::{DynamoTask, TaskState, Workers};
+use crate::context::{DynamoContext, TaskState};
 use crate::error::{LibError, Result};
 use apalis_core::codec::json::JsonCodec;
 use apalis_core::data::Extensions;
-use apalis_core::layers;
 use apalis_core::layers::{Ack, AckLayer};
 use apalis_core::poller::controller::Controller;
 use apalis_core::poller::stream::BackendStream;
@@ -13,7 +12,6 @@ use apalis_core::task::task_id::TaskId;
 use apalis_core::worker::WorkerId;
 use apalis_core::{Backend, Codec};
 use async_stream::try_stream;
-use aws_sdk_dynamodb::operation::query::QueryInput;
 use aws_sdk_dynamodb::{
     client::Client,
     error::SdkError,
@@ -24,13 +22,9 @@ use aws_sdk_dynamodb::{
     },
 };
 use chrono::Utc;
-use futures::{lock, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use serde::{de::DeserializeOwned, Serialize};
-use serde_dynamo::{from_item, from_items, to_item};
-use serde_json::to_string;
-use uuid::timestamp::context;
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,8 +65,8 @@ const JOB_TABLE_NAME: &str = "apalis-jobs";
 
 #[derive(Debug, Clone)]
 pub struct ApiRequest<T> {
-    pub(crate) req: T,
-    pub(crate) context: DynamoTask,
+    req: T,
+    context: DynamoContext,
 }
 
 impl<T> From<ApiRequest<T>> for Request<T> {
@@ -130,12 +124,20 @@ impl Config {
     }
 }
 
-pub fn event_key(key: &str) -> String {
-    format!("events/ev-{key}.json")
-}
-
 type ArcCodec<T> =
     Arc<Box<dyn Codec<T, String, Error = apalis_core::error::Error> + Sync + Send + 'static>>;
+
+type AttributeMap = HashMap<String, AttributeValue>;
+
+trait Constructor {
+    fn new() -> Self;
+}
+
+impl Constructor for AttributeMap {
+    fn new() -> Self {
+        HashMap::new()
+    }
+}
 
 /// Represents a [Storage] that persists to DynamoDB
 // Store the Job state to dynamo
@@ -233,8 +235,6 @@ async fn create_table(
     Ok(())
 }
 
-type AttributeMap = HashMap<String, AttributeValue>;
-
 async fn put(db: &Client, table_name: &String, item: AttributeMap) -> Result<()> {
     let request = db.put_item().table_name(table_name).set_item(Some(item));
 
@@ -254,57 +254,103 @@ async fn put(db: &Client, table_name: &String, item: AttributeMap) -> Result<()>
     Ok(())
 }
 
-fn task_to_attr(task: DynamoTask, partition_key: &str) -> AttributeMap {
-    let mut item: AttributeMap = HashMap::new();
+fn context_to_attr(task: DynamoContext, partition_key: &str) -> AttributeMap {
+    let mut attr_value: AttributeMap = HashMap::new();
     let now = Utc::now().timestamp();
     let task_id = task.id.to_string();
-    item.insert("#pk".into(), AttributeValue::S(partition_key.to_string()));
-    item.insert(
-        "#sk".into(),
+    let mut attr_name: HashMap<String, String> = HashMap::new();
+    attr_name.insert("#pk".into(), partition_key.to_string());
+    attr_value.insert(
+        "#pk".into(),
         AttributeValue::S(format!("{partition_key}#{task_id}")),
     );
+    attr_name.insert("#sk".into(), ATTR_TASK_STATUS.into());
+    attr_value.insert("#sk".into(), AttributeValue::S(task.status.to_string()));
 
-    item.insert(
-        ATTR_TASK_STATUS.into(),
-        AttributeValue::S(task.status.to_string()),
-    );
-    item.insert(ATTR_TASK_RUNAT.into(), AttributeValue::N(now.to_string()));
-    item.insert(
+    attr_value.insert(ATTR_TASK_RUNAT.into(), AttributeValue::N(now.to_string()));
+    attr_value.insert(
         ATTR_TASK_ATTEMPTS.into(),
         AttributeValue::N(task.attempts().to_string()),
     );
     if let Some(err) = task.last_error() {
-        item.insert(ATTR_TASK_LAST_ERROR.into(), AttributeValue::S(err.clone()));
+        attr_value.insert(ATTR_TASK_LAST_ERROR.into(), AttributeValue::S(err.clone()));
     }
     if let Some(lock_by) = task.lock_by() {
-        item.insert(
+        attr_value.insert(
             ATTR_TASK_LOCK_AT.into(),
             AttributeValue::S(lock_by.to_string()),
         );
     }
     if let Some(done_at) = task.done_at() {
-        item.insert(
+        attr_value.insert(
             ATTR_TASK_DONE_AT.into(),
             AttributeValue::N(done_at.to_string()),
         );
     }
-    item.insert(
-        ATTR_TASK_WORKER_ID.into(),
-        AttributeValue::S(task.worker_id.to_string()),
-    );
-    item.insert(ATTR_TASK_JOB.into(), AttributeValue::S(task.job.clone()));
-    item.insert(
-        ATTR_TASK_JOB_TYPE.into(),
-        AttributeValue::S(task.job_type.clone()),
-    );
 
-    item
+    attr_value
 }
 
-fn worker_to_attr(worker: Workers, partition_key: &str) -> AttributeMap {
-    let mut item: AttributeMap = HashMap::new();
+fn attr_to_context(item: &AttributeMap) -> Result<DynamoContext> {
+    let id = item["id"]
+        .as_s()
+        .map_err(|_| LibError::MalformedObject("Task id is invalid".into()))
+        .map(|id| TaskId::from_str(id).unwrap())?
+        .clone();
 
-    item
+    let status = item[ATTR_TASK_STATUS]
+        .as_s()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_STATUS.into()))
+        .map(|status| TaskState::from_str(&status).unwrap())?;
+
+    let run_at = item[ATTR_TASK_RUNAT]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_RUNAT.into()))
+        .map(|run_at| run_at.parse::<i64>().unwrap())?;
+
+    let attempts = item[ATTR_TASK_ATTEMPTS]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_ATTEMPTS.into()))
+        .map(|run_at| run_at.parse::<i32>().unwrap())?;
+
+    let max_attempts = item[ATTR_TASK_MAX_ATTEMPTS]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_MAX_ATTEMPTS.into()))
+        .map(|run_at| run_at.parse::<i32>().unwrap())?;
+
+    let last_error = item[ATTR_TASK_LAST_ERROR]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_LAST_ERROR.into()))
+        .map(|run_at| run_at.clone())?;
+
+    let lock_at = item[ATTR_TASK_LOCK_AT]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_LOCK_AT.into()))
+        .map(|run_at| run_at.parse::<i64>().unwrap())?;
+
+    let done_at = item[ATTR_TASK_DONE_AT]
+        .as_n()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_DONE_AT.into()))
+        .map(|run_at| run_at.parse::<i64>().unwrap())?;
+
+    let lock_by = item[ATTR_TASK_LOCK_BY]
+        .as_s()
+        .map_err(|_| LibError::MalformedObject(ATTR_TASK_LOCK_BY.into()))
+        .map(|lock_by| WorkerId::from_str(lock_by).unwrap())?;
+
+    let task = DynamoContext {
+        id,
+        status, // Mark all the pending job to running
+        run_at,
+        attempts,
+        max_attempts,
+        last_error: Some(last_error),
+        lock_at: Some(lock_at),
+        lock_by: Some(lock_by),
+        done_at: Some(done_at),
+    };
+
+    Ok(task)
 }
 
 impl<T: Job + Serialize + DeserializeOwned> DynamoStorage<T> {
@@ -364,20 +410,49 @@ impl<T: Job + Serialize + DeserializeOwned> DynamoStorage<T> {
         let worker_type = T::NAME;
         let storage_name = std::any::type_name::<Self>();
         let layers = std::any::type_name::<Service>();
-        let workers = Workers::new(
-            worker_id.to_string(),
-            worker_type.to_string(),
-            storage_name.to_string(),
-            layers.to_string(),
-            last_seen,
+        let mut attr_name: HashMap<String, String> = HashMap::new();
+        let mut attr_value: AttributeMap = HashMap::new();
+        attr_name.insert("#pk".into(), WORKER_PARTITION_KEY_NAME.into());
+        attr_value.insert(
+            "#pk".into(),
+            AttributeValue::S(format!(
+                "{0}#{1}",
+                WORKER_PARTITION_KEY_NAME,
+                worker_id.to_string()
+            )),
         );
-        let task = DynamoTask::new(TaskId::new(), worker_id.clone());
-        let item = task_to_attr(task, &TASK_PARTITION_KEY_NAME);
-        put(&self.client, &self.table_name, item).await?;
+        attr_name.insert("#sk".into(), "worker_type".into());
+        attr_value.insert("#sk".into(), AttributeValue::S(worker_type.to_string()));
+        attr_value.insert(
+            "storage_name".into(),
+            AttributeValue::S(storage_name.to_string()),
+        );
+        attr_value.insert("layers".into(), AttributeValue::S(layers.to_string()));
+        attr_value.insert("last_seen".into(), AttributeValue::N(last_seen.to_string()));
+        let condition = "attribute_not_exists(#pk) AND attribute_not_exists(#sk)";
+        match self
+            .client
+            .put_item()
+            .table_name(JOB_TABLE_NAME)
+            .set_expression_attribute_names(Some(attr_name))
+            .set_item(Some(attr_value))
+            .condition_expression(condition)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if matches!(&e,SdkError::<PutItemError>::ServiceError (err)
+                if matches!(
+                    err.err(),PutItemError::ConditionalCheckFailedException(_)
 
-        let worker_map = worker_to_attr(workers, &WORKER_PARTITION_KEY_NAME);
-        put(&self.client, &self.table_name, worker_map).await?;
-        Ok(())
+                )) {
+                    return Err(LibError::Concurrency);
+                }
+
+                return Err(LibError::DynamoPut(e));
+            }
+        }
     }
 
     /// Expose the pool for other functionality, eg custom migrations
@@ -393,110 +468,81 @@ async fn fetch_next<T: Job>(
     id: String,
     table_name: &String,
     partition_key: &String,
-) -> Result<Option<ApiRequest<String>>> {
+) -> Result<DynamoContext> {
     let now: i64 = Utc::now().timestamp();
-    let key = format!("{}-{}", id, worker_id.to_string());
+    // let key = format!("{}-{}", id, worker_id.to_string());
 
     let job_type: String = T::NAME.to_string();
 
-    let mut attribute_values = HashMap::new();
+    let mut attr_names: HashMap<String, String> = HashMap::new();
+    attr_names.insert("#pk".into(), partition_key.clone());
 
-    let key_condition = "job_type = :job_type AND status = :status";
+    let mut attr_values = HashMap::new();
+    attr_values.insert(":job_type".into(), AttributeValue::S(job_type.to_string()));
+    attr_values.insert(":pending".into(), AttributeValue::S("Pending".to_string()));
+    attr_values.insert(":running".into(), AttributeValue::S("Running".to_string()));
+    attr_values.insert(":lock_by".into(), AttributeValue::S(worker_id.to_string()));
+    attr_values.insert(":lock_at".into(), AttributeValue::N(now.to_string()));
 
-    attribute_values.insert("#pk".into(), AttributeValue::S(partition_key.clone()));
-    attribute_values.insert(":job_type".into(), AttributeValue::S(job_type.clone()));
-    attribute_values.insert(
-        ":status".into(),
-        AttributeValue::S(TaskState::Pending.to_string()),
-    );
+    // Step 1: Perform a conditional update
+    let _response = db
+        .update_item()
+        .table_name(table_name)
+        .set_expression_attribute_names(Some(attr_names))
+        .key(
+            "#pk",
+            AttributeValue::S(format!("{0}#{1}", partition_key, id)),
+        )
+        .condition_expression(
+            "job_type = :job_type AND status = :pending AND attribute_not_exists(lock_by)",
+        )
+        .update_expression("SET status = :running, lock_by = :lock_by, lock_at = :lock_at")
+        .set_expression_attribute_values(Some(attr_values))
+        .return_values("ALL_NEW".into()) // Return the updated item
+        .send()
+        .await;
+
+    // Step 2: Retrieve the item to confirm
+    let partition_key = format!("{0}#{1}", partition_key, id);
+
+    let mut attr_names = HashMap::new();
+    attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
+    attr_names.insert("#sk".into(), "status".into());
+    // let mut attr_values = HashMap::new();
+
+    // attr_values.insert(":job_type".into(), AttributeValue::S(job_type.clone()));
+
     let result = db
-        .scan()
-        .set_expression_attribute_values(Some(attribute_values))
-        .filter_expression("job_type = :job_type AND status = :status")
+        .get_item()
+        .key("#pk", AttributeValue::S(partition_key))
+        .key("#sk", AttributeValue::S("Pending".to_string()))
+        .set_expression_attribute_names(Some(attr_names))
         .send()
         .await?;
 
-    // let tasks = vec![];
-    if let Some(items) = result.items {
-        for item in items {
-            let id = item["id"]
-                .as_s()
-                .map_err(|e| LibError::MalformedObject("Task id is invalid".into()))
-                .map(|id| TaskId::from_str(id).unwrap())?
-                .clone();
-            let run_at = item[ATTR_TASK_RUNAT]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_RUNAT.into()))
-                .map(|run_at| run_at.parse::<i64>().unwrap())?;
+    let Some(item) = result.item else {
+        return Err(LibError::ItemNotFound);
+    };
 
-            let attempts = item[ATTR_TASK_ATTEMPTS]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_ATTEMPTS.into()))
-                .map(|run_at| run_at.parse::<i32>().unwrap())?;
+    let job_type_found = item["job_type"]
+        .as_s()
+        .map_err(|_| LibError::MalformedObject("Task id is invalid".into()))
+        .map(|id| id.clone())?
+        .clone();
 
-            let max_attempts = item[ATTR_TASK_MAX_ATTEMPTS]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_MAX_ATTEMPTS.into()))
-                .map(|run_at| run_at.parse::<i32>().unwrap())?;
-
-            let last_error = item[ATTR_TASK_LAST_ERROR]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_LAST_ERROR.into()))
-                .map(|run_at| run_at.clone())?;
-
-            let lock_at = item[ATTR_TASK_LOCK_AT]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_LOCK_AT.into()))
-                .map(|run_at| run_at.parse::<i64>().unwrap())?;
-
-            let lock_by = item[ATTR_TASK_LOCK_BY]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_LOCK_BY.into()))
-                .map(|run_at| run_at.parse::<i64>().unwrap())?;
-
-            let done_at = item[ATTR_TASK_DONE_AT]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_DONE_AT.into()))
-                .map(|run_at| run_at.parse::<i64>().unwrap())?;
-
-            let job = item[ATTR_TASK_JOB]
-                .as_n()
-                .map_err(|_| LibError::MalformedObject(ATTR_TASK_JOB.into()))
-                .map(|run_at| run_at.clone())?;
-
-            let task = DynamoTask {
-                id,
-                status: TaskState::Running, // Mark all the pending job to running
-                run_at,
-                attempts,
-                max_attempts,
-                last_error: Some(last_error),
-                lock_at: Some(now),
-                lock_by: Some(worker_id.clone()),
-                done_at: Some(done_at),
-                worker_id: worker_id.clone(),
-                job,
-                job_type: job_type.clone(),
-            };
-
-            let attr_value = task_to_attr(task.clone(), partition_key);
-            // Update the value to db
-            // put(&db, &table_name, job.clone()).await?;
-            let request = ApiRequest {
-                req: "".to_string(),
-                context: task,
-            };
-
-            // Ok(Some(request))
-        }
+    if job_type_found != job_type {
+        return Err(LibError::ItemNotFound);
     }
+    let mut context = attr_to_context(&item)?;
 
-    todo!()
+    context.status = TaskState::Running;
+    context.lock_by = Some(worker_id.clone());
+
+    Ok(context)
 }
 
 impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
-    // TODO: Fix this stream jobs
-    async fn stream_jobs<'a>(
+    fn stream_jobs<'a>(
         &'a self,
         worker_id: &'a WorkerId,
         interval: Duration,
@@ -514,12 +560,12 @@ impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
                 // let fetch_query = "SELECT id FROM Jobs
                 // WHERE (status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))
                 // AND run_at < ?1 AND job_type = ?2 LIMIT ?3";
+
                 let job_type = T::NAME;
                 let now: i64 = Utc::now().timestamp();
-                let run_at_str = 0.to_string(); // Change this to valid value
                 let max_attemps = 10; // Change this to valid value
 
-                let filter_expression = "(status = :pending OR (status = :failed AND :attempts < max_attempts)) AND run_at < :run_at AND job_type = :job_type";
+                let filter_expression = "(status = :pending OR (status = :failed AND attempts < max_attempts)) AND run_at < :run_at AND job_type = :job_type";
 
                 let mut attr_value: AttributeMap = HashMap::new();
                 attr_value.insert(
@@ -530,11 +576,8 @@ impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
                     ":failed".into(),
                     AttributeValue::S(TaskState::Failed.to_string()),
                 );
-                attr_value.insert(
-                    ":attempts".into(),
-                    AttributeValue::N(max_attemps.to_string()),
-                );
-                attr_value.insert(":run_at".into(), AttributeValue::N(run_at_str));
+
+                attr_value.insert(":run_at".into(), AttributeValue::N(now.to_string()));
                 attr_value.insert(":job_type".into(), AttributeValue::S(job_type.to_string()));
 
                 let result = client
@@ -548,6 +591,7 @@ impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
                     Some(context) => context,
                     None => vec![]
                 };
+
                 for ctx in contexts {
                     let id = ctx["id"].as_s().map_err(|_| LibError::MalformedObject("id".to_string()))?.clone();
                     let res = fetch_next::<T>(
@@ -557,22 +601,25 @@ impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
                         &self.table_name,
                         &partition_key,
                     )
-                    .await?;
-                    
+                    .await;
+
                     yield match res {
-                        None => None::<Request<T>>,
-                        Some(c) => Some(
-                            ApiRequest {
-                                context: c.context,
-                                req: codec.decode(&c.req).map_err(|e| {
-                                    LibError::InvalidData(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        e,
-                                    ))
-                                })?,
+                        Err(_) => None::<Request<T>>,
+                        Ok(c) => {
+                            // TODO: Fix this ApiRequest
+                            let req = codec.decode(&id).map_err(|e| {
+                                LibError::InvalidData(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    e,
+                                ))
+                            })?;
+                            let req = ApiRequest {
+                                context: c,
+                                req,
                             }
-                            .into(),
-                        ),
+                            .into();
+                            Some(req)
+                        }
                     }
                     .map(Into::into);
                 }
@@ -603,13 +650,14 @@ where
         let job = self.codec.encode(&job).map_err(|e| LibError::Apalis(e))?;
         let job_type = T::NAME;
 
-        // TODO: Define a new worker or use existing worker
-        let worker_id = WorkerId::new("test-worker");
-        let mut context = DynamoTask::new(id.clone(), worker_id);
-        context.job = job;
-        context.job_type = job_type.to_string();
-        context.status = TaskState::Pending;
-        let item = task_to_attr(context, &TASK_PARTITION_KEY_NAME);
+        let context = DynamoContext::new(id.clone());
+        let mut item = context_to_attr(context, &TASK_PARTITION_KEY_NAME);
+        item.insert("job_type".into(), AttributeValue::S(job_type.into()));
+        item.insert("job".into(), AttributeValue::S(job));
+        item.insert(
+            TASK_PARTITION_KEY_NAME.into(),
+            AttributeValue::S(format!("{0}#{1}", TASK_PARTITION_KEY_NAME, id.to_string())),
+        );
         put(&self.client, &self.table_name, item);
 
         Ok(id)
@@ -619,47 +667,51 @@ where
         let id = TaskId::new();
         let job = self.codec.encode(&job).map_err(|e| LibError::Apalis(e))?;
         let job_type = T::NAME;
-        let worker_id = WorkerId::new("test-worker");
-        let search_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, id.to_string());
-        let run_at = Utc::now().timestamp() + 4; // Replace this with `on` args
+        let partition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, id.to_string());
         // let run_at = {
         //     let four = chrono::Duration::seconds(4);
         //     let now = Utc::now() + four;
         //     now.timestamp()
         // };
 
-        let update_expr = "SET job = :job, job_type = :job_type, status = :status, run_at = :run_at";
-        let mut attr_value: AttributeMap = HashMap::new();
-        attr_value.insert("job".into(), AttributeValue::S(job));
-        attr_value.insert("job_type".into(), AttributeValue::S(job_type.to_string()));
-        attr_value.insert("status".into(), AttributeValue::S(TaskState::Pending.to_string()));
-        attr_value.insert("run_at".into(), AttributeValue::N(run_at.to_string()));
+        let update_expr =
+            "SET job = :job, job_type = :job_type, status = :status, run_at = :run_at";
+        let mut attr_names: HashMap<String, String> = HashMap::new();
+        attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
 
-        let _update_output = self.client
+        let mut attr_value: AttributeMap = HashMap::new();
+        attr_value.insert(":job".into(), AttributeValue::S(job));
+        attr_value.insert(":job_type".into(), AttributeValue::S(job_type.to_string()));
+        attr_value.insert(":status".into(), AttributeValue::S("Pending".to_string()));
+        attr_value.insert(":run_at".into(), AttributeValue::N(on.to_string()));
+
+        let _update_output = self
+            .client
             .update_item()
-            .key("#pk", AttributeValue::S(TASK_PARTITION_KEY_NAME.into()))
-            .key("#sk", AttributeValue::S(search_key))
+            .key("#pk", AttributeValue::S(partition_key))
+            .set_expression_attribute_names(Some(attr_names))
             .set_expression_attribute_values(Some(attr_value))
             .update_expression(update_expr)
             .send()
-            .await.map_err(|e| LibError::DynamoUpdate(e))?;
-        
+            .await
+            .map_err(|e| LibError::DynamoUpdate(e))?;
+
         Ok(id)
     }
 
     async fn fetch_by_id(&self, job_id: &TaskId) -> Result<Option<Request<Self::Job>>> {
-        let attr_value: AttributeMap = HashMap::new();
-        let search_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.to_string());
-        attr_value.insert(
-            "#pk".into(),
-            AttributeValue::S(TASK_PARTITION_KEY_NAME.into()),
-        );
-        attr_value.insert("#sk".into(), AttributeValue::S(search_key));
+        let mut attr_value: AttributeMap = HashMap::new();
+        let mut attr_names: HashMap<String, String> = HashMap::new();
+        attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
+
+        let partition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.to_string());
+        attr_value.insert("#pk".into(), AttributeValue::S(partition_key));
 
         let query_output = self
             .client
             .query()
-            .table_name(self.table_name)
+            .table_name(&self.table_name)
+            .set_expression_attribute_names(Some(attr_names))
             .set_expression_attribute_values(Some(attr_value))
             .limit(1)
             .send()
@@ -668,34 +720,41 @@ where
 
         match query_output.items {
             Some(items) => {
-                
-                let context = DynamoTask {
-                    id: todo!(),
-                    status: todo!(),
-                    run_at: todo!(),
-                    attempts: todo!(),
-                    max_attempts: todo!(),
-                    last_error: todo!(),
-                    lock_at: todo!(),
-                    lock_by: todo!(),
-                    done_at: todo!(),
-                    worker_id: todo!(),
-                    job: todo!(),
-                    job_type: todo!(),
-                };
-                let res = ApiRequest {
-                    context,
-                    req: self.codec.decode(&c.req).map_err(|e| LibError::Apalis(e))?,
+                if items.is_empty() {
+                    return Err(LibError::ItemNotFound);
                 }
-                .into();
-                Ok(res)
+                let item = &items[0];
+                let context = attr_to_context(item)?;
+
+                let req = self
+                    .codec
+                    .decode(&job_id.to_string())
+                    .map_err(|e| LibError::Apalis(e))?;
+                // TODO: Fix this ApiRequest
+                let res = ApiRequest { context, req };
+                Ok(Some(res.into()))
             }
             _ => Err(LibError::ItemNotFound),
         }
     }
 
     async fn len(&self) -> Result<i64> {
-        todo!()
+        use aws_sdk_dynamodb::types::Select;
+
+        let query_response = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .key_condition_expression("#sk = :pending")
+            .expression_attribute_names("#sk", "status")
+            .expression_attribute_values(":pending", AttributeValue::S("Pending".to_string()))
+            .select(Select::Count)
+            .send()
+            .await
+            .map_err(|e| LibError::DynamoQuery(e))?;
+
+        let count = query_response.count().into();
+        Ok(count)
     }
 
     async fn reschedule(&mut self, job: Request<T>, wait: Duration) -> Result<()> {
@@ -721,23 +780,23 @@ where
 
         let now: i64 = Utc::now().timestamp();
         let wait_until = now + wait;
-        let search_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, task_id.to_string());
+        let partition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, task_id.to_string());
 
         let mut attr_value: AttributeMap = HashMap::new();
-        
+        let mut attr_names = HashMap::new();
+        attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
+
+        attr_value.insert("#pk".into(), AttributeValue::S(partition_key.clone()));
         attr_value.insert(":run_at".into(), AttributeValue::N(wait_until.to_string()));
-        attr_value.insert(
-            ":status".into(),
-            AttributeValue::S(TaskState::Failed.to_string()),
-        );
+        attr_value.insert(":status".into(), AttributeValue::S("Failed".to_string()));
         attr_value.insert(":null".to_string(), AttributeValue::Null(true));
 
         let _context = self
             .client
             .update_item()
-            .key("#pk", AttributeValue::S(TASK_PARTITION_KEY_NAME.into()))
-            .key("#sk", AttributeValue::S(search_key))
+            .key("#pk", AttributeValue::S(partition_key))
             .update_expression(update_expression)
+            .set_expression_attribute_names(Some(attr_names))
             .set_expression_attribute_values(Some(attr_value))
             .send()
             .await
@@ -751,7 +810,7 @@ where
     ///  done_at = ?3, lock_by = ?4, lock_at = ?5, last_error = ?6 WHERE id = ?7";
     async fn update(&self, job: Request<Self::Job>) -> Result<()> {
         let ctx = job
-            .get::<DynamoTask>()
+            .get::<DynamoContext>()
             .ok_or(LibError::InvalidData(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Missing SqlContext",
@@ -770,9 +829,11 @@ where
                 status = :status, attempts = :attempts, done_at = :done_at, 
                 lock_by = :lock_by, lock_at = :lock_at, last_error = :last_error
         "#;
-        let search_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.to_string());
-        let mut attr_values: AttributeMap = HashMap::new();
+        let partition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.to_string());
+        let mut attr_names = HashMap::new();
+        attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
 
+        let mut attr_values: AttributeMap = HashMap::new();
         attr_values.insert(":status".into(), AttributeValue::S(status.to_string()));
         attr_values.insert(":attempts".into(), AttributeValue::N(attempts.to_string()));
         attr_values.insert(":done_at".into(), AttributeValue::N(done_at.to_string()));
@@ -786,9 +847,9 @@ where
         let _context = self
             .client
             .update_item()
-            .key("#pk", AttributeValue::S(TASK_PARTITION_KEY_NAME.into()))
-            .key("#sk", AttributeValue::S(search_key))
+            .key("#pk", AttributeValue::S(partition_key))
             .update_expression(update_expr)
+            .set_expression_attribute_names(Some(attr_names))
             .set_expression_attribute_values(Some(attr_values))
             .send()
             .await
@@ -803,15 +864,15 @@ where
 
     // let query = "Delete from Jobs where status='Done'";
     async fn vacuum(&self) -> Result<usize> {
-        let query_output = self.client
+        let query_output = self
+            .client
             .query()
-            .index_name("#gsi1") // Assume there is a GSI on status
             .key_condition_expression("status = :status")
             .expression_attribute_values(":status", AttributeValue::S(TaskState::Done.to_string()))
             .send()
             .await
             .map_err(|e| LibError::DynamoQuery(e))?;
-        
+
         // If no items were found, return early
         let mut deleted: usize = 0;
 
@@ -821,15 +882,19 @@ where
             // Extract the primary key (PK and SK) from the item to delete
             if let (Some(pk), Some(sk)) = (item.get("#pk"), item.get("#sk")) {
                 // Create a delete request for each item
-                let _delete_item_input = self.client.delete_item()
+                let _delete_item_input = self
+                    .client
+                    .delete_item()
                     .key("#pk", pk.clone())
                     .key("#sk", sk.clone())
-                    .send().await.map_err(|e| LibError::DynamoDelete(e))?;
-                
+                    .send()
+                    .await
+                    .map_err(|e| LibError::DynamoDelete(e))?;
+
                 deleted += 1;
             }
         }
-        
+
         Ok(deleted)
     }
 }
@@ -910,6 +975,7 @@ impl<T> DynamoStorage<T> {
         //         WHERE status= "Failed" AND Jobs.attempts < Jobs.max_attempts
         //         ORDER BY lock_at ASC LIMIT ?2
         // );"#;
+        // NOTE: Make job_id the #pk and lock_by/worker_id as #sk
 
         let max_limit = 10;
         let query_output = self
@@ -974,12 +1040,13 @@ impl<T> DynamoStorage<T> {
         //             AND Workers.worker_type = ?2 ORDER BY lock_at ASC LIMIT ?3
         // );"#;
 
+        // NOTE: This access pattern cannot be retrive using job_id/worker_id
         let max_limit = 10;
         let job_type = T::NAME;
         let query_output = self
             .client
             .query()
-            .index_name("#gsi2") // Assume there's a GSI on worker_type
+            .index_name("#GSI1") // Assume there's a GSI on worker_type
             .key_condition_expression("worker_type = :worker_type AND last_seen < :last_seen")
             .expression_attribute_values(":worker_type", AttributeValue::S(job_type.to_string()))
             .expression_attribute_values(":last_seen", AttributeValue::N(timeout.to_string()))
@@ -1004,25 +1071,33 @@ impl<T> DynamoStorage<T> {
             return Ok(());
         }
 
+        // NOTE: For key_condition to work the attr should be pk and sk
         // Step 2: Query Jobs that match the status and lock_by worker IDs
         let mut job_ids = vec![];
-        for worker_id in worker_ids {
-            let jobs_query_output = self
-                .client
-                .query()
-                .index_name("#gsi1") // Assume there's a GSI on status
-                .key_condition_expression("status = :status AND lock_by = :lock_by")
-                .expression_attribute_values(":status", AttributeValue::S("Running".to_string()))
-                .expression_attribute_values(":lock_by", AttributeValue::S(worker_id.clone()))
-                .limit(max_limit)
-                .scan_index_forward(true) // Ascending order (lock_at)
-                .send()
-                .await
-                .map_err(|e| LibError::DynamoQuery(e))?;
+        let jobs_query_output = self
+            .client
+            .query()
+            .key_condition_expression("status = :status")
+            .expression_attribute_values(
+                ":status",
+                AttributeValue::S(TaskState::Running.to_string()),
+            )
+            .limit(max_limit)
+            .scan_index_forward(true) // Ascending order (lock_at)
+            .send()
+            .await
+            .map_err(|e| LibError::DynamoQuery(e))?;
 
-            if let Some(job_items) = jobs_query_output.items {
+        for worker_id in worker_ids {
+            if let Some(job_items) = &jobs_query_output.items {
                 for item in job_items {
-                    if let Some(job_id) = item.get("id").and_then(|v| v.as_s().ok()) {
+                    let job_id = item.get("id").and_then(|v| v.as_s().ok()).unwrap().clone();
+                    let lock_by = item[ATTR_TASK_LOCK_BY]
+                        .as_s()
+                        .map_err(|_| LibError::MalformedObject(ATTR_TASK_LOCK_BY.into()))
+                        .map(|lock_by| WorkerId::from_str(lock_by).unwrap())?;
+
+                    if lock_by.to_string() == worker_id {
                         job_ids.push(job_id.clone());
                     }
                 }
@@ -1039,11 +1114,14 @@ impl<T> DynamoStorage<T> {
                 last_error = :last_error
             "#;
 
-            let search_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.clone());
+            let partition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, job_id.clone());
+            let mut attr_names = HashMap::new();
+            attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
+
             let mut attr_values = HashMap::new();
             attr_values.insert(
                 ":pending".to_string(),
-                AttributeValue::S(TaskState::Pending.to_string()),
+                AttributeValue::S("Pending".to_string()),
             );
             attr_values.insert(":null".to_string(), AttributeValue::Null(true));
             attr_values.insert(
@@ -1054,9 +1132,9 @@ impl<T> DynamoStorage<T> {
             let _update_output = self
                 .client
                 .update_item()
-                .key("#pk", AttributeValue::S(TASK_PARTITION_KEY_NAME.into()))
-                .key("#sk", AttributeValue::S(search_key))
+                .key("#pk", AttributeValue::S(partition_key))
                 .update_expression(update_expression)
+                .set_expression_attribute_names(Some(attr_names))
                 .set_expression_attribute_values(Some(attr_values))
                 .send()
                 .await
@@ -1077,25 +1155,29 @@ impl<T: Job + Serialize + DeserializeOwned + Sync + Send + Unpin + 'static> Back
         AckLayer::new(self.clone(), worker_id)
     }
 
-    fn poll(mut self, worker: WorkerId) -> Poller<Self::Stream> {
+    fn poll(self, worker: WorkerId) -> Poller<Self::Stream> {
         let config = self.config.clone();
         let controller = self.controller.clone();
-        let stream = self
+        let context = &self;
+        let stream = context
             .stream_jobs(&worker, config.poll_interval, config.buffer_size)
             .map_err(|e| apalis_core::error::Error::SourceError(Box::new(e)));
 
         let stream = BackendStream::new(stream.boxed(), controller);
-        let heartbeat = async move {
-            loop {
-                let now: i64 = Utc::now().timestamp();
-                self.keep_alive_at::<Self::Layer>(&worker, now)
-                    .await
-                    .unwrap();
-                apalis_core::sleep(Duration::from_secs(30)).await;
-            }
-        }
-        .boxed();
-        Poller::new(stream, heartbeat)
+        // let heartbeat = async move {
+        //     loop {
+        //         let now: i64 = Utc::now().timestamp();
+        //         self.keep_alive_at::<Self::Layer>(&worker, now)
+        //             .await
+        //             .unwrap();
+        //         apalis_core::sleep(Duration::from_secs(30)).await;
+        //     }
+        // }
+        // .boxed();
+        
+        // Poller::new(stream, heartbeat)
+        todo!()
+
     }
 }
 
@@ -1103,11 +1185,26 @@ impl<T: Sync> Ack<T> for DynamoStorage<T> {
     type Acknowledger = TaskId;
     type Error = LibError;
     async fn ack(&self, worker_id: &WorkerId, task_id: &Self::Acknowledger) -> Result<()> {
-        // let mut context = get(&self.client, &self.table_name, &task_id.to_string()).await?;
-        // context.status = TaskState::Done;
-        // context.done_at = Some(Utc::now().timestamp());
-        // context.lock_by = Some(worker_id.clone());
-        // put(&self.client, &self.table_name, context);
+        let now = Utc::now().timestamp();
+        let mut attr_names: HashMap<String, String> = HashMap::new();
+        let paritition_key = format!("{0}#{1}", TASK_PARTITION_KEY_NAME, task_id.to_string());
+        attr_names.insert("#pk".into(), TASK_PARTITION_KEY_NAME.into());
+
+        let mut attr_values: AttributeMap = HashMap::new();
+        attr_values.insert(":status".into(), AttributeValue::S("Done".to_string()));
+        attr_values.insert(":done_at".into(), AttributeValue::S(now.to_string()));
+        attr_values.insert(":lock_by".into(), AttributeValue::S(worker_id.to_string()));
+
+        let output = self.client
+            .update_item()
+            .key("#pk", AttributeValue::S(paritition_key))
+            .set_expression_attribute_names(Some(attr_names))
+            .condition_expression("lock_by=:lock_by")
+            .update_expression("SET status=:status, done_at=:done_at")
+            .set_expression_attribute_values(Some(attr_values))
+            .send()
+            .await.map_err(|e| LibError::DynamoUpdate(e))?;
+        
 
         Ok(())
     }
@@ -1231,7 +1328,7 @@ mod tests {
         let worker_id = register_worker(&mut storage).await;
 
         let job = consume_one(&mut storage, &worker_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         assert_eq!(*ctx.status(), TaskState::Running);
         assert_eq!(*ctx.lock_by(), Some(worker_id.clone()));
         assert!(ctx.lock_at().is_some());
@@ -1245,7 +1342,7 @@ mod tests {
         let worker_id = register_worker(&mut storage).await;
 
         let job = consume_one(&mut storage, &worker_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         let job_id = ctx.id();
 
         storage
@@ -1254,7 +1351,7 @@ mod tests {
             .expect("failed to acknowledge the job");
 
         let job = get_job(&mut storage, job_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         assert_eq!(*ctx.status(), TaskState::Done);
         assert!(ctx.done_at().is_some());
     }
@@ -1268,7 +1365,7 @@ mod tests {
         let worker_id = register_worker(&mut storage).await;
 
         let job = consume_one(&mut storage, &worker_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         let job_id = ctx.id();
 
         storage
@@ -1277,7 +1374,7 @@ mod tests {
             .expect("failed to kill job");
 
         let job = get_job(&mut storage, job_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         assert_eq!(*ctx.status(), TaskState::Killed);
         assert!(ctx.done_at().is_some());
     }
@@ -1293,7 +1390,7 @@ mod tests {
         let worker_id = register_worker_at(&mut storage, six_minutes_ago.timestamp()).await;
 
         let job = consume_one(&mut storage, &worker_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         storage
             .reenqueue_orphaned(six_minutes_ago.timestamp())
             .await
@@ -1301,7 +1398,7 @@ mod tests {
 
         let job_id = ctx.id();
         let job = get_job(&mut storage, job_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         // TODO: rework these assertions
         // assert_eq!(*ctx.status(), State::Pending);
         // assert!(ctx.done_at().is_none());
@@ -1320,7 +1417,7 @@ mod tests {
         let worker_id = register_worker_at(&mut storage, four_minutes_ago.timestamp()).await;
 
         let job = consume_one(&mut storage, &worker_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         storage
             .reenqueue_orphaned(four_minutes_ago.timestamp())
             .await
@@ -1328,7 +1425,7 @@ mod tests {
 
         let job_id = ctx.id();
         let job = get_job(&mut storage, job_id).await;
-        let ctx = job.get::<DynamoTask>().unwrap();
+        let ctx = job.get::<DynamoContext>().unwrap();
         assert_eq!(*ctx.status(), TaskState::Running);
         assert_eq!(*ctx.lock_by(), Some(worker_id));
     }
