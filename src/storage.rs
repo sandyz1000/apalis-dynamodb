@@ -38,9 +38,6 @@ const ATTR_TASK_LAST_ERROR: &str = "last_error";
 const ATTR_TASK_LOCK_AT: &str = "lock_at";
 const ATTR_TASK_LOCK_BY: &str = "lock_by";
 const ATTR_TASK_DONE_AT: &str = "done_at";
-const ATTR_TASK_WORKER_ID: &str = "worker_id";
-const ATTR_TASK_JOB: &str = "job";
-const ATTR_TASK_JOB_TYPE: &str = "job_type";
 
 const TASK_PARTITION_KEY_NAME: &str = "task";
 const WORKER_PARTITION_KEY_NAME: &str = "worker";
@@ -129,15 +126,6 @@ type ArcCodec<T> =
 
 type AttributeMap = HashMap<String, AttributeValue>;
 
-trait Constructor {
-    fn new() -> Self;
-}
-
-impl Constructor for AttributeMap {
-    fn new() -> Self {
-        HashMap::new()
-    }
-}
 
 /// Represents a [Storage] that persists to DynamoDB
 // Store the Job state to dynamo
@@ -542,17 +530,17 @@ async fn fetch_next<T: Job>(
 }
 
 impl<T: DeserializeOwned + Send + Unpin + Job> DynamoStorage<T> {
-    fn stream_jobs<'a>(
-        &'a self,
-        worker_id: &'a WorkerId,
+    fn stream_jobs(
+        self,
+        worker_id: WorkerId,
         interval: Duration,
         buffer_size: usize,
-    ) -> impl Stream<Item = Result<Option<Request<T>>>> + 'a {
+    ) -> impl Stream<Item = Result<Option<Request<T>>>>  {
         let client = self.client.clone();
-        let worker_id = worker_id.clone();
         let codec = self.codec.clone();
         let partition_key = TASK_PARTITION_KEY_NAME.to_string();
-
+        
+        let worker_id = worker_id.clone();
         try_stream! {
             loop {
                 apalis_core::sleep(interval).await;
@@ -658,7 +646,7 @@ where
             TASK_PARTITION_KEY_NAME.into(),
             AttributeValue::S(format!("{0}#{1}", TASK_PARTITION_KEY_NAME, id.to_string())),
         );
-        put(&self.client, &self.table_name, item);
+        put(&self.client, &self.table_name, item).await?;
 
         Ok(id)
     }
@@ -1158,25 +1146,28 @@ impl<T: Job + Serialize + DeserializeOwned + Sync + Send + Unpin + 'static> Back
     fn poll(self, worker: WorkerId) -> Poller<Self::Stream> {
         let config = self.config.clone();
         let controller = self.controller.clone();
-        let context = &self;
-        let stream = context
-            .stream_jobs(&worker, config.poll_interval, config.buffer_size)
+        let w1 = worker.clone();
+        let store = self.clone();
+        let stream = store
+            .stream_jobs(w1, config.poll_interval, config.buffer_size)
             .map_err(|e| apalis_core::error::Error::SourceError(Box::new(e)));
 
         let stream = BackendStream::new(stream.boxed(), controller);
-        // let heartbeat = async move {
-        //     loop {
-        //         let now: i64 = Utc::now().timestamp();
-        //         self.keep_alive_at::<Self::Layer>(&worker, now)
-        //             .await
-        //             .unwrap();
-        //         apalis_core::sleep(Duration::from_secs(30)).await;
-        //     }
-        // }
-        // .boxed();
+        let heartbeat = {
+            let mut store = self.clone();
+            async move {
+                loop {
+                    let now: i64 = Utc::now().timestamp();
+                    store.keep_alive_at::<Self::Layer>(&worker, now)
+                        .await
+                        .unwrap();
+                    apalis_core::sleep(Duration::from_secs(30)).await;
+                }
+            }.boxed()
+        };
         
-        // Poller::new(stream, heartbeat)
-        todo!()
+        
+        Poller::new(stream, heartbeat)
 
     }
 }
@@ -1283,8 +1274,9 @@ mod tests {
         storage: &mut DynamoStorage<Email>,
         worker_id: &WorkerId,
     ) -> Request<Email> {
-        let mut stream = storage
-            .stream_jobs(worker_id, std::time::Duration::from_secs(10), 1)
+        let s1 = storage.clone();
+        let mut stream = s1
+            .stream_jobs(worker_id.clone(), std::time::Duration::from_secs(10), 1)
             .boxed();
         stream
             .next()
