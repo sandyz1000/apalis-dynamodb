@@ -1,7 +1,7 @@
 use aws_sdk_dynamodb::{
     error::SdkError,
     operation::{
-        create_table::CreateTableError, delete_item::{DeleteItemError, DeleteItemInput}, get_item::GetItemError, list_tables::ListTablesError, put_item::PutItemError, query::QueryError, scan::ScanError, update_item::UpdateItemError
+        create_table::CreateTableError, delete_item::DeleteItemError, get_item::GetItemError, list_tables::ListTablesError, put_item::PutItemError, query::QueryError, scan::ScanError, update_item::UpdateItemError
     },
 };
 

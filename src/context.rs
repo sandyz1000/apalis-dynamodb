@@ -21,6 +21,12 @@ pub struct DynamoContext {
     pub done_at: Option<i64>,
 }
 
+impl Default for DynamoContext {
+    fn default() -> Self {
+        Self::new(TaskId::new())
+    }
+}
+
 impl DynamoContext {
     /// Build a new context with defaults given an ID.
     pub fn new(id: TaskId) -> Self {
@@ -164,7 +170,7 @@ impl FromStr for TaskState {
             "Retry" => Ok(TaskState::Retry),
             "Failed" => Ok(TaskState::Failed),
             "Killed" => Ok(TaskState::Killed),
-            _ => Err(Error::InvalidContext("Invalid Job state".to_string())),
+            _ => Err(Error::MissingData("Invalid Job state".to_string())),
         }
     }
 }
